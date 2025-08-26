@@ -45,7 +45,7 @@ app.post('/api/recommendations', async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    // FIXED: Join saved_items with links to get the actual item data
+    // Query with correct column name: thumbnail
     const { data: savedItems, error: fetchError } = await supabase
       .from('saved_items')
       .select(`
@@ -54,7 +54,8 @@ app.post('/api/recommendations', async (req, res) => {
           url,
           title,
           brand,
-          price
+          price,
+          thumbnail
         )
       `)
       .eq('user_id', userId)
@@ -95,11 +96,13 @@ Return ONLY a JSON object with this exact structure:
       "title": "Product Name",
       "brand": "Brand Name", 
       "price": "199",
-      "image_url": "",  // or null
+      "image_url": "https://example.com/image.jpg",
       "reason": "Brief explanation why this matches their style"
     }
   ]
-}`;
+}
+
+Make sure to include realistic image URLs for each product.`;
 
     console.log('Calling OpenAI...');
     
@@ -109,7 +112,7 @@ Return ONLY a JSON object with this exact structure:
       messages: [
         { 
           role: "system", 
-          content: "You are a personal shopping assistant. Recommend real products that match the user's style based on their saved items. Use realistic product names, brands, and approximate prices."
+          content: "You are a personal shopping assistant. Recommend real products that match the user's style based on their saved items. Use realistic product names, brands, approximate prices, and include plausible image URLs."
         },
         { role: "user", content: prompt }
       ],
@@ -120,7 +123,7 @@ Return ONLY a JSON object with this exact structure:
     const recommendations = JSON.parse(completion.choices[0].message.content);
     console.log('Generated recommendations:', recommendations.recommendations?.length || 0);
 
-    // Save to recommendations table
+    // Save to recommendations table (keeping image_url as the field name)
     if (recommendations.recommendations && recommendations.recommendations.length > 0) {
       const recsToInsert = recommendations.recommendations.map(rec => ({
         user_id: userId,
