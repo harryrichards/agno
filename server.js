@@ -54,8 +54,7 @@ app.post('/api/recommendations', async (req, res) => {
           url,
           title,
           brand,
-          price,
-          image_url
+          price
         )
       `)
       .eq('user_id', userId)
@@ -96,7 +95,7 @@ Return ONLY a JSON object with this exact structure:
       "title": "Product Name",
       "brand": "Brand Name", 
       "price": "199",
-      "image_url": "https://example.com/image.jpg",
+      "image_url": "",  // or null
       "reason": "Brief explanation why this matches their style"
     }
   ]
