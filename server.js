@@ -1,24 +1,33 @@
-import express from 'express';
-import cors from 'cors';
-import { createClient } from '@supabase/supabase-js';
-import OpenAI from 'openai';
-import dotenv from 'dotenv';
-
-dotenv.config();
+const express = require('express');
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+const OpenAI = require('openai');
 
 const app = express();
-app.use(cors());
+
+// IMPORTANT: Configure CORS to allow your Lovable app
+app.use(cors({
+  origin: [
+    'https://preview--peruze.lovable.app',
+    'https://peruze.lovable.app',
+    'http://localhost:3000',
+    'http://localhost:5173'
+  ],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 
-// Initialize Supabase
+// Initialize clients
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
 
-// Initialize OpenAI
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: process.env.OPENAI_API_KEY
 });
 
 // Health check endpoint
@@ -26,21 +35,20 @@ app.get('/', (req, res) => {
   res.json({ status: 'Recommendation service is running!' });
 });
 
-// Main recommendation endpoint
+// Main recommendations endpoint
 app.post('/api/recommendations', async (req, res) => {
   try {
     const { userId } = req.body;
     
     if (!userId) {
-      return res.status(400).json({ error: 'userId is required' });
+      return res.status(400).json({ error: 'User ID is required' });
     }
 
     // Fetch user's saved items
     const { data: savedItems, error: fetchError } = await supabase
       .from('saved_items')
-      .select('url, title, description')
+      .select('url, title, brand, price')
       .eq('user_id', userId)
-      .order('created_at', { ascending: false })
       .limit(20);
 
     if (fetchError) {
@@ -49,72 +57,79 @@ app.post('/api/recommendations', async (req, res) => {
     }
 
     if (!savedItems || savedItems.length === 0) {
-      return res.json({ recommendations: [], message: 'No saved items found' });
+      return res.json({ recommendations: [] });
     }
 
     // Create prompt for OpenAI
     const itemsList = savedItems.map(item => 
-      `- ${item.title}: ${item.url}`
+      `- ${item.title} (${item.brand}) - $${item.price}`
     ).join('\n');
 
-    const prompt = `Based on these saved items from a user's digital pinboard, suggest 5-10 similar or complementary items they might find interesting:
-
+    const prompt = `Based on these saved items from a fashion/shopping app:
 ${itemsList}
 
-Return a JSON object with a "recommendations" array. Each recommendation should have:
-- url: a valid URL to the recommended content
-- title: a descriptive title
-- reason: a brief explanation of why this was recommended based on their interests
+Suggest 5-10 similar products they might like. Return ONLY a JSON object with this exact structure:
+{
+  "recommendations": [
+    {
+      "url": "product URL",
+      "title": "product name",
+      "brand": "brand name",
+      "price": "price as string like 299",
+      "image_url": "image URL if available",
+      "reason": "why this matches their style"
+    }
+  ]
+}`;
 
-Focus on variety and quality. Look for related but not duplicate content.`;
-
-    // Call OpenAI
+    // Get recommendations from OpenAI
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        {
-          role: "system",
-          content: "You are a helpful content recommendation assistant. Always return valid JSON."
-        },
-        {
-          role: "user",
-          content: prompt
-        }
+        { role: "system", content: "You are a personal shopping assistant that recommends products based on user preferences." },
+        { role: "user", content: prompt }
       ],
-      temperature: 0.7,
-      response_format: { type: "json_object" }
+      response_format: { type: "json_object" },
+      temperature: 0.7
     });
 
     const recommendations = JSON.parse(completion.choices[0].message.content);
 
     // Save recommendations to database
     if (recommendations.recommendations && recommendations.recommendations.length > 0) {
-      const recommendationsToSave = recommendations.recommendations.map(rec => ({
+      const recsToInsert = recommendations.recommendations.map(rec => ({
         user_id: userId,
         url: rec.url,
         title: rec.title,
+        brand: rec.brand,
+        price: rec.price,
+        image_url: rec.image_url,
         reason: rec.reason,
-        created_at: new Date().toISOString()
+        feedback: null,
+        is_saved: false
       }));
 
       const { error: insertError } = await supabase
         .from('recommendations')
-        .insert(recommendationsToSave);
+        .insert(recsToInsert);
 
       if (insertError) {
         console.error('Error saving recommendations:', insertError);
-        // Continue anyway - we have the recommendations
       }
     }
 
     res.json(recommendations);
+
   } catch (error) {
     console.error('Error generating recommendations:', error);
-    res.status(500).json({ error: 'Failed to generate recommendations' });
+    res.status(500).json({ 
+      error: 'Failed to generate recommendations',
+      details: error.message 
+    });
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Recommendation service running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
