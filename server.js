@@ -20,10 +20,16 @@ app.use(cors({
 
 app.use(express.json());
 
-// Initialize clients
+// Initialize Supabase with service role key (bypasses RLS)
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
+  process.env.SUPABASE_ANON_KEY, // This will actually be your service role key
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    }
+  }
 );
 
 const openai = new OpenAI({
@@ -50,6 +56,7 @@ app.post('/api/recommendations', async (req, res) => {
       .from('saved_items')
       .select(`
         user_id,
+        link_id,
         links (
           url,
           title,
@@ -63,21 +70,30 @@ app.post('/api/recommendations', async (req, res) => {
 
     if (fetchError) {
       console.error('Error fetching saved items:', fetchError);
-      return res.status(500).json({ error: 'Failed to fetch saved items' });
+      return res.status(500).json({ error: 'Failed to fetch saved items', details: fetchError.message });
     }
 
     console.log('Found saved items:', savedItems?.length || 0);
-
+    
     if (!savedItems || savedItems.length === 0) {
+      console.log('No saved items found for user');
       return res.json({ recommendations: [] });
     }
+
+    // Debug logging
+    console.log('First saved item structure:', JSON.stringify(savedItems[0], null, 2));
 
     // Extract the link data from the joined query
     const items = savedItems.map(item => item.links).filter(Boolean);
     
+    console.log('Extracted items with link data:', items.length);
+    
     if (items.length === 0) {
+      console.log('No items with valid link data found');
       return res.json({ recommendations: [] });
     }
+
+    console.log('Sample item:', items[0]);
 
     // Create prompt for OpenAI
     const itemsList = items.map(item => 
@@ -102,9 +118,9 @@ Return ONLY a JSON object with this exact structure:
   ]
 }
 
-Make sure to include realistic image URLs for each product.`;
+Make sure to include realistic product URLs and image URLs for each product.`;
 
-    console.log('Calling OpenAI...');
+    console.log('Calling OpenAI with', items.length, 'saved items...');
     
     // Get recommendations from OpenAI
     const completion = await openai.chat.completions.create({
@@ -123,7 +139,7 @@ Make sure to include realistic image URLs for each product.`;
     const recommendations = JSON.parse(completion.choices[0].message.content);
     console.log('Generated recommendations:', recommendations.recommendations?.length || 0);
 
-    // Save to recommendations table (keeping image_url as the field name)
+    // Save to recommendations table
     if (recommendations.recommendations && recommendations.recommendations.length > 0) {
       const recsToInsert = recommendations.recommendations.map(rec => ({
         user_id: userId,
@@ -144,6 +160,8 @@ Make sure to include realistic image URLs for each product.`;
       if (insertError) {
         console.error('Error saving recommendations:', insertError);
         // Continue anyway - we can still return the recommendations
+      } else {
+        console.log('Successfully saved recommendations to database');
       }
     }
 
