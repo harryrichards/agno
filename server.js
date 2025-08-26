@@ -5,11 +5,11 @@ const OpenAI = require('openai');
 
 const app = express();
 
-// IMPORTANT: Configure CORS to allow your Lovable app
+// Configure CORS
 app.use(cors({
   origin: [
     'https://preview--peruze.lovable.app',
-    'https://peruze.lovable.app',
+    'https://peruze.lovable.app', 
     'http://localhost:3000',
     'http://localhost:5173'
   ],
@@ -30,24 +30,34 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-// Health check endpoint
+// Health check
 app.get('/', (req, res) => {
   res.json({ status: 'Recommendation service is running!' });
 });
 
-// Main recommendations endpoint
+// Recommendations endpoint
 app.post('/api/recommendations', async (req, res) => {
   try {
     const { userId } = req.body;
+    console.log('Received request for userId:', userId);
     
     if (!userId) {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    // Fetch user's saved items
+    // FIXED: Join saved_items with links to get the actual item data
     const { data: savedItems, error: fetchError } = await supabase
       .from('saved_items')
-      .select('url, title, brand, price')
+      .select(`
+        user_id,
+        links (
+          url,
+          title,
+          brand,
+          price,
+          image_url
+        )
+      `)
       .eq('user_id', userId)
       .limit(20);
 
@@ -56,37 +66,52 @@ app.post('/api/recommendations', async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch saved items' });
     }
 
+    console.log('Found saved items:', savedItems?.length || 0);
+
     if (!savedItems || savedItems.length === 0) {
       return res.json({ recommendations: [] });
     }
 
+    // Extract the link data from the joined query
+    const items = savedItems.map(item => item.links).filter(Boolean);
+    
+    if (items.length === 0) {
+      return res.json({ recommendations: [] });
+    }
+
     // Create prompt for OpenAI
-    const itemsList = savedItems.map(item => 
-      `- ${item.title} (${item.brand}) - $${item.price}`
+    const itemsList = items.map(item => 
+      `- ${item.title || 'Untitled'} (${item.brand || 'Unknown brand'}) - $${item.price || 'N/A'}`
     ).join('\n');
 
-    const prompt = `Based on these saved items from a fashion/shopping app:
+    const prompt = `Based on these saved fashion/shopping items:
 ${itemsList}
 
-Suggest 5-10 similar products they might like. Return ONLY a JSON object with this exact structure:
+Suggest 5-8 similar products they might like. Focus on similar styles, brands, and price ranges.
+Return ONLY a JSON object with this exact structure:
 {
   "recommendations": [
     {
-      "url": "product URL",
-      "title": "product name",
-      "brand": "brand name",
-      "price": "price as string like 299",
-      "image_url": "image URL if available",
-      "reason": "why this matches their style"
+      "url": "https://example.com/product",
+      "title": "Product Name",
+      "brand": "Brand Name", 
+      "price": "199",
+      "image_url": "https://example.com/image.jpg",
+      "reason": "Brief explanation why this matches their style"
     }
   ]
 }`;
 
+    console.log('Calling OpenAI...');
+    
     // Get recommendations from OpenAI
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: "You are a personal shopping assistant that recommends products based on user preferences." },
+        { 
+          role: "system", 
+          content: "You are a personal shopping assistant. Recommend real products that match the user's style based on their saved items. Use realistic product names, brands, and approximate prices."
+        },
         { role: "user", content: prompt }
       ],
       response_format: { type: "json_object" },
@@ -94,8 +119,9 @@ Suggest 5-10 similar products they might like. Return ONLY a JSON object with th
     });
 
     const recommendations = JSON.parse(completion.choices[0].message.content);
+    console.log('Generated recommendations:', recommendations.recommendations?.length || 0);
 
-    // Save recommendations to database
+    // Save to recommendations table
     if (recommendations.recommendations && recommendations.recommendations.length > 0) {
       const recsToInsert = recommendations.recommendations.map(rec => ({
         user_id: userId,
@@ -115,6 +141,7 @@ Suggest 5-10 similar products they might like. Return ONLY a JSON object with th
 
       if (insertError) {
         console.error('Error saving recommendations:', insertError);
+        // Continue anyway - we can still return the recommendations
       }
     }
 
