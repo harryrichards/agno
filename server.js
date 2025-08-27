@@ -46,10 +46,10 @@ app.post('/api/recommendations', async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    // FIXED: Query links table directly, not saved_items
+    // Query links table with all fields
     const { data: links, error: fetchError } = await supabase
       .from('links')
-      .select('url, title, brand, price, thumbnail')
+      .select('url, title, description, thumbnail, price, brand')
       .eq('user_id', userId)
       .limit(20);
 
@@ -65,26 +65,37 @@ app.post('/api/recommendations', async (req, res) => {
       return res.json({ recommendations: [] });
     }
 
-    // Extract brands for search query
-    const brands = [...new Set(links.map(item => item.brand).filter(Boolean))].slice(0, 3);
-    const searchQuery = brands.length > 0 
-      ? `${brands.join(' ')} fashion clothing`
-      : 'trending fashion items';
+    // Create a comprehensive description from all user's saved item data
+    const itemDescriptions = links
+      .slice(0, 5)
+      .map(item => {
+        const parts = [];
+        if (item.title) parts.push(item.title);
+        if (item.brand) parts.push(`by ${item.brand}`);
+        if (item.price) parts.push(`$${item.price}`);
+        if (item.description) parts.push(item.description.substring(0, 50));
+        return parts.join(' ');
+      })
+      .join('; ');
 
-    console.log('Calling Flask discover service with query:', searchQuery);
+    // You could also try sending the first item's URL directly
+    const contextUrl = links[0]?.url;
 
-    // Call Flask service for real products
+    console.log('Using context for Flask:', itemDescriptions.substring(0, 200));
+
+    // Call Flask service - try both URL and description
     try {
+      const flaskBody = contextUrl 
+        ? { url: contextUrl, max_results: 10 }  // Try with URL first
+        : { description: itemDescriptions, max_results: 10 }; // Fallback to description
+
       const flaskResponse = await fetch('https://peruze.onrender.com/discover', {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
           'Accept': 'application/json'
         },
-        body: JSON.stringify({
-          query: searchQuery,  // Try different parameter names if this doesn't work
-          num_results: 10
-        })
+        body: JSON.stringify(flaskBody)
       });
 
       console.log('Flask response status:', flaskResponse.status);
@@ -92,7 +103,32 @@ app.post('/api/recommendations', async (req, res) => {
       if (!flaskResponse.ok) {
         const errorText = await flaskResponse.text();
         console.error('Flask service error:', flaskResponse.status, errorText);
-        return res.json({ recommendations: [] });
+        
+        // If URL failed, retry with description
+        if (contextUrl && flaskResponse.status === 400) {
+          console.log('Retrying with description instead of URL');
+          const retryResponse = await fetch('https://peruze.onrender.com/discover', {
+            method: 'POST',
+            headers: { 
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            },
+            body: JSON.stringify({
+              description: itemDescriptions,
+              max_results: 10
+            })
+          });
+          
+          if (retryResponse.ok) {
+            const searchResults = await retryResponse.json();
+            console.log('Retry successful, got', searchResults.results?.length || 0, 'results');
+            // Process results below
+          } else {
+            return res.json({ recommendations: [] });
+          }
+        } else {
+          return res.json({ recommendations: [] });
+        }
       }
 
       const searchResults = await flaskResponse.json();
@@ -111,15 +147,18 @@ app.post('/api/recommendations', async (req, res) => {
               imageUrl = product.thumbnail;
             }
 
+            // Extract brands from saved items for context
+            const userBrands = [...new Set(links.map(l => l.brand).filter(Boolean))].slice(0, 3);
+
             return {
               url: product.link || product.product_link || '',
               title: product.title || 'Unknown Product',
               brand: product.source || product.brand || 'Unknown Brand',
               price: product.price ? String(product.price).replace(/[^0-9.]/g, '') : '0',
               image_url: imageUrl, // null if no valid image
-              reason: brands.length > 0 
-                ? `Based on your interest in ${brands.join(', ')}`
-                : 'Trending item you might like'
+              reason: userBrands.length > 0 
+                ? `Based on your interest in ${userBrands.join(', ')}`
+                : 'Based on your saved collection'
             };
           })
           .filter(rec => rec.url && rec.title) // Only keep valid recommendations
