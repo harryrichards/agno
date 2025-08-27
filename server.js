@@ -46,47 +46,27 @@ app.post('/api/recommendations', async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    // Fetch saved items with proper join
-    const { data: savedItems, error: fetchError } = await supabase
-      .from('saved_items')
-      .select(`
-        user_id,
-        link_id,
-        links (
-          url,
-          title,
-          brand,
-          price,
-          thumbnail
-        )
-      `)
+    // FIXED: Query links table directly, not saved_items
+    const { data: links, error: fetchError } = await supabase
+      .from('links')
+      .select('url, title, brand, price, thumbnail')
       .eq('user_id', userId)
       .limit(20);
 
     if (fetchError) {
-      console.error('Error fetching saved items:', fetchError);
-      return res.status(500).json({ error: 'Failed to fetch saved items', details: fetchError.message });
+      console.error('Error fetching links:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch links', details: fetchError.message });
     }
 
-    console.log('Found saved items:', savedItems?.length || 0);
+    console.log('Found links:', links?.length || 0);
     
-    if (!savedItems || savedItems.length === 0) {
-      console.log('No saved items found for user');
-      return res.json({ recommendations: [] });
-    }
-
-    // Extract link data
-    const items = savedItems.map(item => item.links).filter(Boolean);
-    
-    console.log('Extracted items with link data:', items.length);
-    
-    if (items.length === 0) {
-      console.log('No items with valid link data found');
+    if (!links || links.length === 0) {
+      console.log('No links found for user');
       return res.json({ recommendations: [] });
     }
 
     // Extract brands for search query
-    const brands = [...new Set(items.map(item => item.brand).filter(Boolean))].slice(0, 3);
+    const brands = [...new Set(links.map(item => item.brand).filter(Boolean))].slice(0, 3);
     const searchQuery = brands.length > 0 
       ? `${brands.join(' ')} fashion clothing`
       : 'trending fashion items';
@@ -97,15 +77,21 @@ app.post('/api/recommendations', async (req, res) => {
     try {
       const flaskResponse = await fetch('https://peruze.onrender.com/discover', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
         body: JSON.stringify({
-          query: searchQuery,
+          query: searchQuery,  // Try different parameter names if this doesn't work
           num_results: 10
         })
       });
 
+      console.log('Flask response status:', flaskResponse.status);
+
       if (!flaskResponse.ok) {
-        console.error('Flask service error:', flaskResponse.status);
+        const errorText = await flaskResponse.text();
+        console.error('Flask service error:', flaskResponse.status, errorText);
         return res.json({ recommendations: [] });
       }
 
