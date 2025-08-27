@@ -45,7 +45,7 @@ app.get('/', (req, res) => {
 async function generateEmbedding(text) {
   const response = await openai.embeddings.create({
     input: text,
-    model: "text-embedding-3-small" // 1536 dimensions, good balance of performance and cost
+    model: "text-embedding-3-small"
   });
   return response.data[0].embedding;
 }
@@ -65,7 +65,7 @@ app.post('/api/recommendations', async (req, res) => {
       .from('links')
       .select('id, url, title, description, brand, price, thumbnail')
       .eq('user_id', userId)
-      .limit(5); // Get a few recent items to understand style
+      .limit(5);
 
     if (fetchError) {
       console.error('Error fetching links:', fetchError);
@@ -90,7 +90,6 @@ app.post('/api/recommendations', async (req, res) => {
     const userEmbedding = await generateEmbedding(userStyleText);
 
     // Get all links with embeddings from database (excluding user's own)
-    // Note: This assumes you have an 'embedding' column in your links table
     const { data: allLinks, error: linksError } = await supabase
       .from('links')
       .select('id, url, title, brand, price, thumbnail, embedding')
@@ -99,22 +98,18 @@ app.post('/api/recommendations', async (req, res) => {
       .limit(100);
 
     if (!allLinks || allLinks.length === 0) {
-      console.log('No other links with embeddings found');
-      
-      // Fallback: Use OpenAI to generate recommendations without similarity search
-      return await generateOpenAIRecommendations(userLinks, userId, res);
+      console.log('No other links with embeddings found - using OpenAI fallback');
+      return await generateOpenAIRecommendations(userLinks, userId, res, supabase);
     }
 
     console.log(`Calculating similarity with ${allLinks.length} items...`);
 
     // Calculate cosine similarity for each item
     const itemsWithSimilarity = allLinks.map(item => {
-      // Parse embedding if it's stored as a string
       const itemEmbedding = typeof item.embedding === 'string' 
         ? JSON.parse(item.embedding) 
         : item.embedding;
       
-      // Calculate cosine similarity
       const similarity = cosineSimilarity(userEmbedding, itemEmbedding);
       
       return {
@@ -170,6 +165,18 @@ app.post('/api/recommendations', async (req, res) => {
 
   } catch (error) {
     console.error('Error generating recommendations:', error);
+    
+    // If embeddings fail, try OpenAI fallback
+    if (error.message && error.message.includes('embedding')) {
+      const { data: userLinks } = await supabase
+        .from('links')
+        .select('id, url, title, description, brand, price, thumbnail')
+        .eq('user_id', req.body.userId)
+        .limit(5);
+      
+      return await generateOpenAIRecommendations(userLinks, req.body.userId, res, supabase);
+    }
+    
     res.status(500).json({ 
       error: 'Failed to generate recommendations',
       details: error.message 
@@ -185,8 +192,8 @@ function cosineSimilarity(vecA, vecB) {
   return dotProduct / (magnitudeA * magnitudeB);
 }
 
-// Fallback function using OpenAI generation
-async function generateOpenAIRecommendations(userLinks, userId, res) {
+// Fallback function using OpenAI generation (FIXED)
+async function generateOpenAIRecommendations(userLinks, userId, res, supabase) {
   console.log('Using OpenAI fallback for recommendations');
   
   const savedItemsContext = userLinks.slice(0, 10).map(item => 
@@ -197,31 +204,59 @@ async function generateOpenAIRecommendations(userLinks, userId, res) {
     model: "gpt-4o-mini",
     messages: [{
       role: "system",
-      content: `You're a fashion expert. Suggest 8 real products based on the user's style.`
+      content: `You're a fashion personal stylist and online shopping expert. Suggest 8 real products based on the user's style. Return your response as valid JSON format.`
     }, {
       role: "user",
-      content: `Based on these saved items:\n${savedItemsContext}\n\nSuggest similar products.`
+      content: `Based on these saved items:\n${savedItemsContext}\n\nSuggest 8 similar products they would like. Return as JSON with this structure:
+{
+  "recommendations": [
+    {
+      "title": "Product Name",
+      "brand": "Brand Name",
+      "price": "199",
+      "reason": "Why this matches their style"
+    }
+  ]
+}`
     }],
-    response_format: { type: "json_object" }
+    response_format: { type: "json_object" },
+    temperature: 0.8
   });
 
   const aiRecommendations = JSON.parse(completion.choices[0].message.content);
   
   const recommendations = {
     recommendations: (aiRecommendations.recommendations || []).slice(0, 8).map(rec => ({
-      url: `https://www.google.com/search?q=${encodeURIComponent(`${rec.brand} ${rec.title}`)}`,
+      url: `https://www.google.com/search?q=${encodeURIComponent(`${rec.brand} ${rec.title} buy`)}`,
+      title: rec.title || 'Unknown Product',
+      brand: rec.brand || 'Unknown Brand',
+      price: rec.price || '0',
+      image_url: null,
+      reason: rec.reason || 'Matches your style'
+    }))
+  };
+
+  // Save to database
+  if (recommendations.recommendations.length > 0) {
+    const recsToInsert = recommendations.recommendations.map(rec => ({
+      user_id: userId,
+      url: rec.url,
       title: rec.title,
       brand: rec.brand,
       price: rec.price,
-      image_url: null,
-      reason: rec.reason
-    }))
-  };
+      image_url: rec.image_url,
+      reason: rec.reason,
+      feedback: null,
+      is_saved: false
+    }));
+
+    await supabase.from('recommendations').insert(recsToInsert);
+  }
 
   return res.json(recommendations);
 }
 
-// Endpoint to generate embedding for a new link (call this when user saves an item)
+// Endpoint to generate embedding for a new link
 app.post('/api/generate-embedding', async (req, res) => {
   try {
     const { linkId, title, brand, description } = req.body;
