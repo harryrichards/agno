@@ -50,7 +50,91 @@ async function generateEmbedding(text) {
   return response.data[0].embedding;
 }
 
-// Recommendations endpoint using embeddings
+// -------------------------
+// NEW ENDPOINT: Ingest Link
+// -------------------------
+app.post('/api/ingest-link', async (req, res) => {
+  try {
+    const { linkId, userId, url } = req.body;
+    if (!linkId || !userId || !url) {
+      return res.status(400).json({ error: 'linkId, userId, and url are required' });
+    }
+
+    // 1. Call Firecrawl Edge Function
+    const { data: scrapeData, error: scrapeError } = await supabase.functions.invoke('firecrawl-scrape', {
+      body: { url }
+    });
+
+    if (scrapeError) {
+      console.error('Firecrawl scrape error:', scrapeError);
+      return res.status(500).json({ error: 'Failed to scrape URL' });
+    }
+
+    // 2. Extract fields
+    const canonicalUrl = scrapeData?.canonicalUrl || url;
+    const title = scrapeData?.title || null;
+    const brand = scrapeData?.brand || null;
+    const price = scrapeData?.priceValue ?? null;
+    const currency = scrapeData?.priceCurrency || null;
+    const imageUrl = scrapeData?.thumbnail || (scrapeData?.images?.[0] ?? null);
+    const website = scrapeData?.siteName || (new URL(canonicalUrl)).hostname;
+
+    // 3. Deduplicate: check if this URL already exists for user
+    const { data: existing } = await supabase
+      .from('links')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('url', canonicalUrl)
+      .maybeSingle();
+
+    if (existing && existing.id !== linkId) {
+      console.log('Duplicate link skipped:', canonicalUrl);
+      await supabase.from('links').delete().eq('id', linkId); // optional cleanup
+      return res.json({ duplicated: true, canonical_url: canonicalUrl });
+    }
+
+    // 4. Generate embedding
+    const text = [brand, title].filter(Boolean).join(' ');
+    const embedding = text ? await generateEmbedding(text) : null;
+
+    // 5. Update link row
+    const { error: updateError } = await supabase
+      .from('links')
+      .update({
+        url: canonicalUrl,
+        website,
+        title,
+        brand,
+        price,
+        currency,
+        image_url: imageUrl,
+        embedding: embedding ? JSON.stringify(embedding) : null
+      })
+      .eq('id', linkId);
+
+    if (updateError) {
+      console.error('Error updating link:', updateError);
+      return res.status(500).json({ error: 'Failed to update link' });
+    }
+
+    res.json({
+      success: true,
+      canonical_url: canonicalUrl,
+      brand,
+      price,
+      currency,
+      image_url: imageUrl
+    });
+
+  } catch (err) {
+    console.error('Error in /api/ingest-link:', err);
+    res.status(500).json({ error: 'Unexpected error', details: err.message });
+  }
+});
+
+// -------------------------
+// Recommendations endpoint
+// -------------------------
 app.post('/api/recommendations', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -63,7 +147,7 @@ app.post('/api/recommendations', async (req, res) => {
     // Get user's saved links
     const { data: userLinks, error: fetchError } = await supabase
       .from('links')
-      .select('id, url, title, description, brand, price, thumbnail')
+      .select('id, url, title, description, brand, price, thumbnail, embedding')
       .eq('user_id', userId);
 
     if (fetchError) {
@@ -84,17 +168,15 @@ app.post('/api/recommendations', async (req, res) => {
     ).join(' ');
 
     console.log('Generating embedding for user style...');
-    
-    // Generate embedding for user's style
     const userEmbedding = await generateEmbedding(userStyleText);
 
     // Get all links with embeddings from database (excluding user's own)
-    const { data: allLinks, error: linksError } = await supabase
+    const { data: allLinks } = await supabase
       .from('links')
       .select('id, url, title, brand, price, thumbnail, embedding')
       .neq('user_id', userId)
       .not('embedding', 'is', null)
-      .limit(100);
+      .limit(200);
 
     if (!allLinks || allLinks.length === 0) {
       console.log('No other links with embeddings found - using OpenAI fallback');
@@ -103,28 +185,21 @@ app.post('/api/recommendations', async (req, res) => {
 
     console.log(`Calculating similarity with ${allLinks.length} items...`);
 
-    // Calculate cosine similarity for each item
     const itemsWithSimilarity = allLinks.map(item => {
       const itemEmbedding = typeof item.embedding === 'string' 
         ? JSON.parse(item.embedding) 
         : item.embedding;
       
       const similarity = cosineSimilarity(userEmbedding, itemEmbedding);
-      
-      return {
-        ...item,
-        similarity
-      };
+      return { ...item, similarity };
     });
 
-    // Sort by similarity and take top recommendations
     const topRecommendations = itemsWithSimilarity
       .sort((a, b) => b.similarity - a.similarity)
       .slice(0, 8);
 
     console.log(`Found ${topRecommendations.length} similar items`);
 
-    // Format recommendations
     const recommendations = {
       recommendations: topRecommendations.map(item => ({
         url: item.url,
@@ -137,7 +212,6 @@ app.post('/api/recommendations', async (req, res) => {
       }))
     };
 
-    // Save to recommendations table
     if (recommendations.recommendations.length > 0) {
       const recsToInsert = recommendations.recommendations.map(rec => ({
         user_id: userId,
@@ -155,17 +229,14 @@ app.post('/api/recommendations', async (req, res) => {
         .from('recommendations')
         .insert(recsToInsert);
 
-      if (insertError) {
-        console.error('Error saving recommendations:', insertError);
-      }
+      if (insertError) console.error('Error saving recommendations:', insertError);
     }
 
     res.json(recommendations);
 
   } catch (error) {
     console.error('Error generating recommendations:', error);
-    
-    // If embeddings fail, try OpenAI fallback
+
     if (error.message && error.message.includes('embedding')) {
       const { data: userLinks } = await supabase
         .from('links')
@@ -183,7 +254,7 @@ app.post('/api/recommendations', async (req, res) => {
   }
 });
 
-// Helper function to calculate cosine similarity
+// Cosine similarity
 function cosineSimilarity(vecA, vecB) {
   const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
   const magnitudeA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
@@ -191,7 +262,7 @@ function cosineSimilarity(vecA, vecB) {
   return dotProduct / (magnitudeA * magnitudeB);
 }
 
-// Fallback function using OpenAI generation (FIXED)
+// OpenAI Fallback
 async function generateOpenAIRecommendations(userLinks, userId, res, supabase) {
   console.log('Using OpenAI fallback for recommendations');
   
@@ -235,7 +306,6 @@ async function generateOpenAIRecommendations(userLinks, userId, res, supabase) {
     }))
   };
 
-  // Save to database
   if (recommendations.recommendations.length > 0) {
     const recsToInsert = recommendations.recommendations.map(rec => ({
       user_id: userId,
@@ -255,7 +325,7 @@ async function generateOpenAIRecommendations(userLinks, userId, res, supabase) {
   return res.json(recommendations);
 }
 
-// Endpoint to generate embedding for a new link
+// Generate embedding manually
 app.post('/api/generate-embedding', async (req, res) => {
   try {
     const { linkId, title, brand, description } = req.body;
@@ -267,7 +337,6 @@ app.post('/api/generate-embedding', async (req, res) => {
 
     const embedding = await generateEmbedding(text);
     
-    // Store embedding in database
     const { error } = await supabase
       .from('links')
       .update({ embedding: JSON.stringify(embedding) })
@@ -285,6 +354,7 @@ app.post('/api/generate-embedding', async (req, res) => {
   }
 });
 
+// Start server
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
