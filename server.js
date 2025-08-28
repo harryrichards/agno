@@ -64,8 +64,7 @@ app.post('/api/recommendations', async (req, res) => {
     const { data: userLinks, error: fetchError } = await supabase
       .from('links')
       .select('id, url, title, description, brand, price, thumbnail')
-      .eq('user_id', userId)
-      .limit(5);
+      .eq('user_id', userId);
 
     if (fetchError) {
       console.error('Error fetching links:', fetchError);
